@@ -18,7 +18,7 @@ app.use(helmet());
 // CORS
 // IMPORTANT: Browsers will reject `Access-Control-Allow-Origin: *` when `credentials: true`.
 // So we explicitly allow common local dev origins + any origins you list in FRONTEND_ORIGIN.
-const defaultDevOrigins = ['http://localhost:5500', 'http://127.0.0.1:5500'];
+const defaultDevOrigins = ['http://localhost:5500', 'http://127.0.0.1:5500',"https://beautiful-lokum-5afa12.netlify.app/"];
 const envOrigins = (process.env.FRONTEND_ORIGIN || '')
   .split(',')
   .map(s => s.trim())
