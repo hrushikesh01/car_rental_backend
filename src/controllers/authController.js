@@ -4,19 +4,27 @@ const { OAuth2Client } = require('google-auth-library');
 const { createUser, createGoogleUser, findUserByEmail, findUserByGoogleId } = require('../models/userModel');
 const { pool } = require('../config/db');
 
+const client = new OAuth2Client(process.env.GOOGLE_CLIENT_ID);
+
+// ================= JWT =================
 function signToken(user) {
   const payload = {
     sub: user.id,
     email: user.email,
   };
-  const secret = process.env.JWT_SECRET || 'dev-secret';
-  const expiresIn = process.env.JWT_EXPIRES_IN || '7d';
-  return jwt.sign(payload, secret, { expiresIn });
+
+  return jwt.sign(
+    payload,
+    process.env.JWT_SECRET || 'dev-secret',
+    { expiresIn: process.env.JWT_EXPIRES_IN || '7d' }
+  );
 }
 
+// ================= SIGNUP =================
 async function signup(req, res, next) {
   try {
     const { name, email, password } = req.body;
+
     if (!name || !email || !password) {
       return res.status(400).json({ message: 'Name, email and password are required' });
     }
@@ -28,22 +36,23 @@ async function signup(req, res, next) {
 
     const hash = await bcrypt.hash(password, 10);
     const user = await createUser({ name, email, passwordHash: hash });
+
     const token = signToken(user);
 
-    res.status(201).json({
-      token,
-      user,
-    });
+    res.status(201).json({ token, user });
+
   } catch (err) {
     next(err);
   }
 }
 
+// ================= LOGIN =================
 async function login(req, res, next) {
   try {
     const { email, password } = req.body;
+
     if (!email || !password) {
-      return res.status(400).json({ message: 'Email and password are required' });
+      return res.status(400).json({ message: 'Email and password required' });
     }
 
     const user = await findUserByEmail(email);
@@ -52,7 +61,7 @@ async function login(req, res, next) {
     }
 
     if (!user.password_hash) {
-      return res.status(401).json({ message: 'Use Google sign-in for this account' });
+      return res.status(401).json({ message: 'Use Google login for this account' });
     }
 
     const valid = await bcrypt.compare(password, user.password_hash);
@@ -60,36 +69,35 @@ async function login(req, res, next) {
       return res.status(401).json({ message: 'Invalid credentials' });
     }
 
-    const token = signToken(user);
-    // Do not expose password_hash
     delete user.password_hash;
 
-    res.json({
-      token,
-      user,
-    });
+    const token = signToken(user);
+
+    res.json({ token, user });
+
   } catch (err) {
     next(err);
   }
 }
 
+// ================= GOOGLE LOGIN =================
 async function googleLogin(req, res, next) {
   try {
-    const { credential } = req.body; // Google ID token
+    const { credential } = req.body;
+
     if (!credential) {
       return res.status(400).json({ message: 'credential is required' });
     }
 
-    const clientId = process.env.GOOGLE_CLIENT_ID;
-    if (!clientId) {
+    if (!process.env.GOOGLE_CLIENT_ID) {
       return res.status(500).json({ message: 'Google login not configured' });
     }
 
-    const client = new OAuth2Client(clientId);
     const ticket = await client.verifyIdToken({
       idToken: credential,
-      audience: clientId,
+      audience: process.env.GOOGLE_CLIENT_ID,
     });
+
     const payload = ticket.getPayload();
 
     const googleId = payload.sub;
@@ -97,22 +105,19 @@ async function googleLogin(req, res, next) {
     const name = payload.name || 'Drive User';
     const avatarUrl = payload.picture || null;
 
-    // 1) Prefer existing Google account
     let user = await findUserByGoogleId(googleId);
 
-    // 2) If same email already exists, link it (only if not already linked)
+    // If not found, check by email
     if (!user) {
-      const existingByEmail = await findUserByEmail(email);
-      if (existingByEmail) {
-        // If this email is already a password account, allow Google login but do not overwrite password.
-        // We link google_id if missing.
-        if (!existingByEmail.google_id) {
-          const { pool } = require('../config/db');
-          await pool.query(`UPDATE users SET google_id = $2, avatar_url = COALESCE(avatar_url, $3) WHERE id = $1`, [
-            existingByEmail.id,
-            googleId,
-            avatarUrl,
-          ]);
+      const existing = await findUserByEmail(email);
+
+      if (existing) {
+        // Link Google account if not linked
+        if (!existing.google_id) {
+          await pool.query(
+            `UPDATE users SET google_id = $2, avatar_url = COALESCE(avatar_url, $3) WHERE id = $1`,
+            [existing.id, googleId, avatarUrl]
+          );
         }
         user = await findUserByEmail(email);
       } else {
@@ -120,97 +125,33 @@ async function googleLogin(req, res, next) {
       }
     }
 
-    // Do not expose password_hash
     delete user.password_hash;
 
     const token = signToken(user);
+
     res.json({ token, user });
+
   } catch (err) {
+    console.error("Google login error:", err);
     next(err);
   }
 }
 
+// ================= GOOGLE CLIENT ID =================
 function googleClientId(req, res) {
   const clientId = process.env.GOOGLE_CLIENT_ID;
-  if (!clientId) {
-    return res.status(500).json({ message: 'Google login not configured' });
-  }
-  return res.json({ clientId });
+
+  console.log("Client ID from ENV:", clientId);
+
+  return res.json({
+    clientId: clientId || null
+  });
 }
 
-// POST /auth/google-login
-// Body: { token: "<google_id_token>" }
-async function googleLoginCompat(req, res) {
-  const googleToken = req.body && (req.body.token || req.body.credential);
-  if (!googleToken) {
-    return res.status(400).json({ message: 'token is required' });
-  }
-
-  const clientId = process.env.GOOGLE_CLIENT_ID;
-  if (!clientId) {
-    return res.status(500).json({ message: 'Google login not configured' });
-  }
-
-  let payload;
-  try {
-    const client = new OAuth2Client(clientId);
-    const ticket = await client.verifyIdToken({
-      idToken: googleToken,
-      audience: clientId,
-    });
-    payload = ticket.getPayload();
-  } catch (err) {
-    return res.status(401).json({ message: 'Invalid Google token' });
-  }
-
-  const name = payload.name || 'Drive User';
-  const email = (payload.email || '').toLowerCase();
-  const picture = payload.picture || null;
-
-  if (!email) {
-    return res.status(400).json({ message: 'Google token missing email' });
-  }
-
-  try {
-    // Find-or-create by email (production-safe, avoids race conditions)
-    const result = await pool.query(
-      `
-      INSERT INTO users (name, email, avatar_url, password_hash)
-      VALUES ($1, $2, $3, NULL)
-      ON CONFLICT (email)
-      DO UPDATE SET
-        name = EXCLUDED.name,
-        avatar_url = COALESCE(users.avatar_url, EXCLUDED.avatar_url)
-      RETURNING id, name, email, avatar_url, created_at
-      `,
-      [name, email, picture]
-    );
-
-    const userRow = result.rows[0];
-    const token = signToken(userRow);
-
-    // Frontend-friendly user shape
-    return res.json({
-      token,
-      user: {
-        id: userRow.id,
-        name: userRow.name,
-        email: userRow.email,
-        avatar: userRow.avatar_url,
-        created_at: userRow.created_at,
-      },
-    });
-  } catch (err) {
-    console.error(err);
-    return res.status(500).json({ message: 'Database error' });
-  }
-}
-
+// ================= EXPORT =================
 module.exports = {
   signup,
   login,
   googleLogin,
-  googleClientId,
-  googleLoginCompat,
+  googleClientId
 };
-
